@@ -1,0 +1,1060 @@
+name: Build EclipsStats
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create project files
+        run: |
+          mkdir -p plugin/src/main/java/ru/eclips/stats plugin/src/main/resources
+          cat > plugin/pom.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+
+            <groupId>ru.eclips</groupId>
+            <artifactId>EclipsStats</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>repo-lanink-cn</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>Nukkit</artifactId>
+                <version>MOT-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <finalName>EclipsStats</finalName>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.11.0</version>
+                  <configuration>
+                    <release>17</release>
+                  </configuration>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          EOF_FILE
+          cat > plugin/src/main/resources/plugin.yml <<'EOF_FILE'
+          name: EclipsStats
+          main: ru.eclips.stats.EclipsStats
+          version: 1.0.0
+          api: ["1.0.0"]
+          author: Eclips
+          description: Статистика посещаемости сервера
+          commands:
+            sstats:
+              description: Статистика посещаемости сервера
+              usage: /sstats [list|top|new|player]
+              permission: sstats.use
+          permissions:
+            sstats.use:
+              description: Доступ к команде /sstats
+              default: op
+          EOF_FILE
+          cat > plugin/src/main/resources/config.yml <<'EOF_FILE'
+          # Часовой пояс для границ дня (сегодня / 7 дней / 30 дней). Список: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+          timezone: "Europe/Moscow"
+
+          # Порог "короткого" пребывания в минутах (по общему времени игрока за 7 дней)
+          short-session-minutes: 20
+
+          # Сколько игроков на одной странице /sstats list и /sstats top
+          list-page-size: 10
+
+          # Сколько игроков на одной странице графического меню (4-20)
+          menu-page-size: 8
+
+          # Пороги блока "За 30 дней" в верхней части меню
+          active-hours-per-week: 5
+          low-hours-per-week: 1
+          very-active-hours-per-week: 20
+          low-total-hours: 2
+          away-days: 7
+          EOF_FILE
+          cat > plugin/src/main/java/ru/eclips/stats/EclipsStats.java <<'EOF_FILE'
+          package ru.eclips.stats;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.event.player.PlayerJoinEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.element.ElementInput;
+          import cn.nukkit.form.response.FormResponseCustom;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindow;
+          import cn.nukkit.form.window.FormWindowCustom;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.TextFormat;
+
+          import java.io.IOException;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.AtomicMoveNotSupportedException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.StandardCopyOption;
+          import java.time.Instant;
+          import java.time.LocalDate;
+          import java.time.LocalDateTime;
+          import java.time.ZoneId;
+          import java.time.format.DateTimeFormatter;
+          import java.time.temporal.ChronoUnit;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.TreeMap;
+          import java.util.function.BiConsumer;
+          import java.util.function.Consumer;
+
+          public class EclipsStats extends PluginBase implements Listener {
+
+              private static final class PData {
+                  String key;
+                  String name;
+                  long firstJoin;
+                  long lastSeen;
+                  long totalSec;
+                  int joins;
+                  final Map<LocalDate, Long> days = new HashMap<>();
+              }
+
+              private static final class Period {
+                  int active;
+                  int news;
+                  int small;
+                  int large;
+              }
+
+              private static final class Quality {
+                  int base;
+                  int active;
+                  int low;
+                  int lowGone;
+                  int once;
+                  int very;
+                  long onceSec;
+              }
+
+              private static final class Menu {
+                  FormWindowSimple simple;
+                  FormWindowCustom custom;
+                  final List<Consumer<Player>> actions = new ArrayList<>();
+                  BiConsumer<Player, String> onInput;
+
+                  FormWindow window() {
+                      return simple != null ? simple : custom;
+                  }
+              }
+
+              private static final DateTimeFormatter DTF = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+
+              private final Map<String, PData> players = new HashMap<>();
+              private final Map<String, Long> checkpoints = new HashMap<>();
+              private final TreeMap<LocalDate, Integer> peaks = new TreeMap<>();
+              private final Map<String, Menu> openMenus = new HashMap<>();
+
+              private ZoneId zone = ZoneId.of("Europe/Moscow");
+              private int shortMinutes = 20;
+              private int pageSize = 10;
+              private int menuPageSize = 8;
+              private int activeHours = 5;
+              private int lowHours = 1;
+              private int veryHours = 20;
+              private int lowTotalHours = 2;
+              private int awayDays = 7;
+              private Path dataFile;
+              private boolean dirty = false;
+              private int saveCounter = 0;
+
+              // ------------------------------------------------------------------ lifecycle
+
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  saveDefaultConfig();
+                  loadSettings();
+                  dataFile = getDataFolder().toPath().resolve("players.tsv");
+                  load();
+                  getServer().getPluginManager().registerEvents(this, this);
+
+                  long now = System.currentTimeMillis();
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      joinRecord(p, now, false);
+                      checkpoints.put(key(p), now);
+                  }
+                  updatePeak();
+
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          tick();
+                      }
+                  }, 600);
+
+                  getLogger().info("EclipsStats включён. Игроков в базе: " + players.size() + ", часовой пояс: " + zone);
+              }
+
+              @Override
+              public void onDisable() {
+                  long now = System.currentTimeMillis();
+                  for (String k : new ArrayList<>(checkpoints.keySet())) {
+                      account(k, now);
+                  }
+                  save();
+              }
+
+              private void loadSettings() {
+                  String tz = getConfig().getString("timezone", "Europe/Moscow");
+                  try {
+                      zone = ZoneId.of(tz);
+                  } catch (Exception e) {
+                      zone = ZoneId.of("Europe/Moscow");
+                      getLogger().warning("EclipsStats: неверный часовой пояс '" + tz + "', использую Europe/Moscow");
+                  }
+                  shortMinutes = Math.max(1, getConfig().getInt("short-session-minutes", 20));
+                  pageSize = Math.max(3, Math.min(30, getConfig().getInt("list-page-size", 10)));
+                  menuPageSize = Math.max(4, Math.min(20, getConfig().getInt("menu-page-size", 8)));
+                  activeHours = Math.max(1, getConfig().getInt("active-hours-per-week", 5));
+                  lowHours = Math.max(1, getConfig().getInt("low-hours-per-week", 1));
+                  veryHours = Math.max(1, getConfig().getInt("very-active-hours-per-week", 20));
+                  lowTotalHours = Math.max(1, getConfig().getInt("low-total-hours", 2));
+                  awayDays = Math.max(1, getConfig().getInt("away-days", 7));
+              }
+
+              // ------------------------------------------------------------------ events
+
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onJoin(PlayerJoinEvent e) {
+                  Player p = e.getPlayer();
+                  long now = System.currentTimeMillis();
+                  joinRecord(p, now, true);
+                  checkpoints.put(key(p), now);
+                  updatePeak();
+              }
+
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onQuit(PlayerQuitEvent e) {
+                  Player p = e.getPlayer();
+                  long now = System.currentTimeMillis();
+                  String k = key(p);
+                  account(k, now);
+                  PData d = players.get(k);
+                  if (d != null) {
+                      d.lastSeen = now;
+                  }
+                  checkpoints.remove(k);
+                  openMenus.remove(k);
+                  dirty = true;
+              }
+
+              @EventHandler(priority = EventPriority.NORMAL)
+              public void onForm(PlayerFormRespondedEvent e) {
+                  Player p = e.getPlayer();
+                  String k = key(p);
+                  Menu m = openMenus.get(k);
+                  if (m == null || e.getWindow() != m.window()) {
+                      return;
+                  }
+                  openMenus.remove(k);
+                  if (e.wasClosed() || e.getResponse() == null) {
+                      return;
+                  }
+                  try {
+                      flushOnline();
+                      if (m.simple != null) {
+                          FormResponseSimple r = (FormResponseSimple) e.getResponse();
+                          int id = r.getClickedButtonId();
+                          if (id >= 0 && id < m.actions.size()) {
+                              m.actions.get(id).accept(p);
+                          }
+                      } else if (m.custom != null && m.onInput != null) {
+                          FormResponseCustom r = (FormResponseCustom) e.getResponse();
+                          m.onInput.accept(p, r.getInputResponse(0));
+                      }
+                  } catch (Exception ex) {
+                      p.sendMessage(TextFormat.RED + "Ошибка меню статистики: " + ex);
+                      getLogger().error("EclipsStats: " + ex);
+                  }
+              }
+
+              private void tick() {
+                  long now = System.currentTimeMillis();
+                  Set<String> online = new HashSet<>();
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      String k = key(p);
+                      online.add(k);
+                      if (!checkpoints.containsKey(k)) {
+                          joinRecord(p, now, false);
+                          checkpoints.put(k, now);
+                      }
+                      account(k, now);
+                  }
+                  Iterator<String> it = checkpoints.keySet().iterator();
+                  while (it.hasNext()) {
+                      if (!online.contains(it.next())) {
+                          it.remove();
+                      }
+                  }
+                  updatePeak();
+                  saveCounter++;
+                  if (dirty && saveCounter >= 10) {
+                      save();
+                      saveCounter = 0;
+                  }
+              }
+
+              // ------------------------------------------------------------------ accounting
+
+              private String key(Player p) {
+                  return p.getName().toLowerCase(Locale.ROOT);
+              }
+
+              private String clean(String s) {
+                  return s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
+              }
+
+              private LocalDate dateOf(long ms) {
+                  return Instant.ofEpochMilli(ms).atZone(zone).toLocalDate();
+              }
+
+              private String fmt(long ms) {
+                  return LocalDateTime.ofInstant(Instant.ofEpochMilli(ms), zone).format(DTF);
+              }
+
+              private String dur(long sec) {
+                  long h = sec / 3600;
+                  long m = (sec % 3600) / 60;
+                  if (h > 0) {
+                      return h + "ч " + m + "м";
+                  }
+                  if (m > 0) {
+                      return m + "м";
+                  }
+                  return sec + "с";
+              }
+
+              private long firstPlayedMs(Player p, long now) {
+                  try {
+                      Object v = p.getClass().getMethod("getFirstPlayed").invoke(p);
+                      if (v instanceof Number) {
+                          long n = ((Number) v).longValue();
+                          if (n <= 0) {
+                              return now;
+                          }
+                          if (n < 100_000_000_000L) {
+                              n *= 1000L;
+                          }
+                          return Math.min(n, now);
+                      }
+                  } catch (Throwable ignored) {
+                      // метод недоступен, считаем игрока новым
+                  }
+                  return now;
+              }
+
+              private PData joinRecord(Player p, long now, boolean countJoin) {
+                  String k = key(p);
+                  PData d = players.get(k);
+                  if (d == null) {
+                      d = new PData();
+                      d.key = k;
+                      d.firstJoin = firstPlayedMs(p, now);
+                      players.put(k, d);
+                  }
+                  d.name = clean(p.getName());
+                  if (countJoin) {
+                      d.joins++;
+                  }
+                  d.lastSeen = now;
+                  d.days.putIfAbsent(dateOf(now), 0L);
+                  dirty = true;
+                  return d;
+              }
+
+              private void account(String k, long now) {
+                  Long last = checkpoints.get(k);
+                  if (last == null) {
+                      return;
+                  }
+                  long sec = (now - last) / 1000L;
+                  if (sec <= 0) {
+                      return;
+                  }
+                  PData d = players.get(k);
+                  if (d != null) {
+                      d.totalSec += sec;
+                      d.days.merge(dateOf(now), sec, Long::sum);
+                      d.lastSeen = now;
+                      dirty = true;
+                  }
+                  checkpoints.put(k, last + sec * 1000L);
+              }
+
+              private void flushOnline() {
+                  long now = System.currentTimeMillis();
+                  for (String k : new ArrayList<>(checkpoints.keySet())) {
+                      account(k, now);
+                  }
+                  updatePeak();
+              }
+
+              private void updatePeak() {
+                  int n = getServer().getOnlinePlayers().size();
+                  LocalDate t = dateOf(System.currentTimeMillis());
+                  Integer cur = peaks.get(t);
+                  if (cur == null || n > cur) {
+                      peaks.put(t, n);
+                      dirty = true;
+                  }
+              }
+
+              // ------------------------------------------------------------------ storage
+
+              private void load() {
+                  if (!Files.exists(dataFile)) {
+                      return;
+                  }
+                  try {
+                      List<String> lines = Files.readAllLines(dataFile, StandardCharsets.UTF_8);
+                      for (String line : lines) {
+                          if (line.isEmpty()) {
+                              continue;
+                          }
+                          String[] a = line.split("\t", -1);
+                          try {
+                              if (a[0].equals("P")) {
+                                  PData d = new PData();
+                                  d.key = a[1];
+                                  d.name = a[2];
+                                  d.firstJoin = Long.parseLong(a[3]);
+                                  d.lastSeen = Long.parseLong(a[4]);
+                                  d.totalSec = Long.parseLong(a[5]);
+                                  d.joins = Integer.parseInt(a[6]);
+                                  players.put(d.key, d);
+                              } else if (a[0].equals("D")) {
+                                  PData d = players.get(a[1]);
+                                  if (d != null) {
+                                      d.days.put(LocalDate.parse(a[2]), Long.parseLong(a[3]));
+                                  }
+                              } else if (a[0].equals("K")) {
+                                  peaks.put(LocalDate.parse(a[1]), Integer.parseInt(a[2]));
+                              }
+                          } catch (Exception ignored) {
+                              // битая строка пропускается
+                          }
+                      }
+                  } catch (IOException ex) {
+                      getLogger().error("EclipsStats: не удалось прочитать players.tsv: " + ex.getMessage());
+                  }
+              }
+
+              private void save() {
+                  try {
+                      LocalDate cutoff = dateOf(System.currentTimeMillis()).minusDays(62);
+                      StringBuilder sb = new StringBuilder();
+                      sb.append("V\t1\n");
+                      for (PData d : players.values()) {
+                          sb.append("P\t").append(d.key).append('\t').append(d.name).append('\t')
+                                  .append(d.firstJoin).append('\t').append(d.lastSeen).append('\t')
+                                  .append(d.totalSec).append('\t').append(d.joins).append('\n');
+                          for (Map.Entry<LocalDate, Long> de : d.days.entrySet()) {
+                              if (de.getKey().isBefore(cutoff)) {
+                                  continue;
+                              }
+                              sb.append("D\t").append(d.key).append('\t').append(de.getKey()).append('\t')
+                                      .append(de.getValue()).append('\n');
+                          }
+                      }
+                      for (Map.Entry<LocalDate, Integer> pe : peaks.entrySet()) {
+                          sb.append("K\t").append(pe.getKey()).append('\t').append(pe.getValue()).append('\n');
+                      }
+                      Path tmp = dataFile.resolveSibling("players.tsv.tmp");
+                      Files.write(tmp, sb.toString().getBytes(StandardCharsets.UTF_8));
+                      try {
+                          Files.move(tmp, dataFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                      } catch (AtomicMoveNotSupportedException ex) {
+                          Files.move(tmp, dataFile, StandardCopyOption.REPLACE_EXISTING);
+                      }
+                      dirty = false;
+                  } catch (IOException ex) {
+                      getLogger().error("EclipsStats: ошибка сохранения: " + ex.getMessage());
+                  }
+              }
+
+              // ------------------------------------------------------------------ queries
+
+              private boolean activeIn(PData d, LocalDate from, LocalDate to) {
+                  for (LocalDate day : d.days.keySet()) {
+                      if (!day.isBefore(from) && !day.isAfter(to)) {
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              private long secIn(PData d, LocalDate from, LocalDate to) {
+                  long s = 0;
+                  for (Map.Entry<LocalDate, Long> e : d.days.entrySet()) {
+                      if (!e.getKey().isBefore(from) && !e.getKey().isAfter(to)) {
+                          s += e.getValue();
+                      }
+                  }
+                  return s;
+              }
+
+              private Period calc(LocalDate from, LocalDate to) {
+                  Period r = new Period();
+                  long limit = shortMinutes * 60L;
+                  for (PData d : players.values()) {
+                      if (!activeIn(d, from, to)) {
+                          continue;
+                      }
+                      r.active++;
+                      if (!dateOf(d.firstJoin).isBefore(from)) {
+                          r.news++;
+                      }
+                      if (secIn(d, from, to) <= limit) {
+                          r.small++;
+                      } else {
+                          r.large++;
+                      }
+                  }
+                  return r;
+              }
+
+              private int peakIn(LocalDate from, LocalDate to) {
+                  int best = 0;
+                  for (int v : peaks.subMap(from, true, to, true).values()) {
+                      if (v > best) {
+                          best = v;
+                      }
+                  }
+                  return best;
+              }
+
+              // ------------------------------------------------------------------ text builders
+
+              private void line(StringBuilder sb, String label, String value) {
+                  sb.append(TextFormat.YELLOW).append(label).append(": ").append(TextFormat.WHITE).append(value).append('\n');
+              }
+
+              private String overviewBody() {
+                  LocalDate today = dateOf(System.currentTimeMillis());
+                  LocalDate w = today.minusDays(6);
+                  LocalDate m = today.minusDays(29);
+                  Period pd = calc(today, today);
+                  Period pw = calc(w, today);
+                  Period pm = calc(m, today);
+
+                  int bestAll = 0;
+                  LocalDate bestAllDate = null;
+                  for (Map.Entry<LocalDate, Integer> e : peaks.entrySet()) {
+                      if (e.getValue() > bestAll) {
+                          bestAll = e.getValue();
+                          bestAllDate = e.getKey();
+                      }
+                  }
+
+                  StringBuilder sb = new StringBuilder();
+                  line(sb, "Всего игроков за всё время", String.valueOf(players.size()));
+                  line(sb, "Сейчас онлайн", String.valueOf(getServer().getOnlinePlayers().size()));
+                  line(sb, "Пик онлайна", "сегодня " + peakIn(today, today) + " | 7 дней " + peakIn(w, today)
+                          + " | 30 дней " + peakIn(m, today) + " | всё время " + bestAll
+                          + (bestAllDate != null ? " (" + bestAllDate + ")" : ""));
+                  line(sb, "Зашло", "сегодня " + pd.active + " | 7 дней " + pw.active + " | 30 дней " + pm.active);
+                  line(sb, "Из них новые", "сегодня " + pd.news + " | 7 дней " + pw.news + " | 30 дней " + pm.news);
+                  line(sb, "Из них вернувшиеся", "сегодня " + (pd.active - pd.news) + " | 7 дней " + (pw.active - pw.news)
+                          + " | 30 дней " + (pm.active - pm.news));
+                  line(sb, "За 7 дней до " + shortMinutes + " мин", pw.small + " из " + pw.active + " (по общему времени за неделю)");
+                  line(sb, "За 7 дней больше " + shortMinutes + " мин", pw.large + " из " + pw.active);
+                  return sb.toString().trim();
+              }
+
+              private LocalDate minDay(PData d) {
+                  LocalDate best = null;
+                  for (LocalDate day : d.days.keySet()) {
+                      if (best == null || day.isBefore(best)) {
+                          best = day;
+                      }
+                  }
+                  return best;
+              }
+
+              private String pct(int n, int base) {
+                  if (base <= 0) {
+                      return "0%";
+                  }
+                  return String.format(Locale.ROOT, "%.1f%% (%d)", 100.0 * n / base, n);
+              }
+
+              private Quality quality() {
+                  LocalDate today = dateOf(System.currentTimeMillis());
+                  LocalDate from = today.minusDays(29);
+                  long activeSec = activeHours * 3600L;
+                  long lowSec = lowHours * 3600L;
+                  long verySec = veryHours * 3600L;
+                  long lowTotalSec = lowTotalHours * 3600L;
+                  Quality q = new Quality();
+                  for (PData d : players.values()) {
+                      if (!activeIn(d, from, today)) {
+                          continue;
+                      }
+                      q.base++;
+                      LocalDate start = dateOf(d.firstJoin);
+                      if (start.isBefore(from)) {
+                          start = from;
+                      }
+                      long span = ChronoUnit.DAYS.between(start, today) + 1;
+                      double weeks = Math.max(7L, span) / 7.0;
+                      double perWeek = secIn(d, from, today) / weeks;
+                      if (perWeek >= activeSec) {
+                          q.active++;
+                      }
+                      if (perWeek >= verySec) {
+                          q.very++;
+                      }
+                      if (perWeek < lowSec) {
+                          q.low++;
+                      }
+                      boolean gone = dateOf(d.lastSeen).isBefore(today.minusDays(awayDays));
+                      if (d.totalSec < lowTotalSec && gone && !checkpoints.containsKey(d.key)) {
+                          q.lowGone++;
+                      }
+                      LocalDate first = minDay(d);
+                      boolean newToServer = first != null && !dateOf(d.firstJoin).isBefore(first);
+                      if (d.joins == 1 && newToServer && !checkpoints.containsKey(d.key)) {
+                          q.once++;
+                          q.onceSec += d.totalSec;
+                      }
+                  }
+                  return q;
+              }
+
+              private String qualityBody() {
+                  Quality q = quality();
+                  long avg = q.once > 0 ? q.onceSec / q.once : 0;
+                  StringBuilder sb = new StringBuilder();
+                  sb.append(TextFormat.GOLD).append("За 30 дней (активных игроков: ").append(q.base).append(")\n");
+                  line(sb, "Активно, от " + activeHours + " ч в неделю", pct(q.active, q.base));
+                  line(sb, "Меньше " + lowHours + " ч в неделю", pct(q.low, q.base));
+                  line(sb, "Меньше " + lowTotalHours + " ч всего и не заходят " + awayDays + "+ дней", pct(q.lowGone, q.base));
+                  line(sb, "Зашли 1 раз и не вернулись", pct(q.once, q.base) + ", в среднем " + avg + " сек (" + dur(avg) + ")");
+                  line(sb, "Очень активно, от " + veryHours + " ч в неделю", pct(q.very, q.base));
+                  return sb.toString().trim();
+              }
+
+              private int[] newCounts() {
+                  LocalDate today = dateOf(System.currentTimeMillis());
+                  int cd = 0;
+                  int cw = 0;
+                  int cm = 0;
+                  for (PData d : players.values()) {
+                      LocalDate f = dateOf(d.firstJoin);
+                      if (!f.isBefore(today)) {
+                          cd++;
+                      }
+                      if (!f.isBefore(today.minusDays(6))) {
+                          cw++;
+                      }
+                      if (!f.isBefore(today.minusDays(29))) {
+                          cm++;
+                      }
+                  }
+                  return new int[]{cd, cw, cm};
+              }
+
+              private String periodTitle(int days) {
+                  if (days <= 1) {
+                      return "за сегодня";
+                  }
+                  return days <= 7 ? "за 7 дней" : "за 30 дней";
+              }
+
+              private String newNicksText(int days, boolean withCounts) {
+                  LocalDate from = dateOf(System.currentTimeMillis()).minusDays(days - 1L);
+                  List<PData> list = new ArrayList<>();
+                  for (PData d : players.values()) {
+                      if (!dateOf(d.firstJoin).isBefore(from)) {
+                          list.add(d);
+                      }
+                  }
+                  list.sort((a, b) -> Long.compare(b.firstJoin, a.firstJoin));
+
+                  StringBuilder sb = new StringBuilder();
+                  if (withCounts) {
+                      int[] c = newCounts();
+                      line(sb, "Новых ников", "сегодня " + c[0] + " | 7 дней " + c[1] + " | 30 дней " + c[2]);
+                  }
+                  sb.append(TextFormat.YELLOW).append("Список ").append(periodTitle(days)).append(" (").append(list.size()).append("):\n");
+                  int shown = Math.min(list.size(), 40);
+                  for (int i = 0; i < shown; i++) {
+                      PData d = list.get(i);
+                      sb.append(TextFormat.WHITE).append(d.name).append(TextFormat.GRAY).append(" - ")
+                              .append(fmt(d.firstJoin)).append('\n');
+                  }
+                  if (list.size() > shown) {
+                      sb.append(TextFormat.GRAY).append("... и ещё ").append(list.size() - shown);
+                  } else if (list.isEmpty()) {
+                      sb.append(TextFormat.GRAY).append("Новых ников нет");
+                  }
+                  return sb.toString().trim();
+              }
+
+              private String playerBody(PData d) {
+                  LocalDate today = dateOf(System.currentTimeMillis());
+                  StringBuilder sb = new StringBuilder();
+                  line(sb, "Первый заход", fmt(d.firstJoin));
+                  line(sb, "Последний заход", checkpoints.containsKey(d.key) ? "сейчас онлайн" : fmt(d.lastSeen));
+                  line(sb, "Заходов (с установки плагина)", String.valueOf(d.joins));
+                  line(sb, "Онлайн за всё время", dur(d.totalSec));
+                  line(sb, "Онлайн сегодня / 7 дней / 30 дней", dur(secIn(d, today, today)) + " / "
+                          + dur(secIn(d, today.minusDays(6), today)) + " / " + dur(secIn(d, today.minusDays(29), today)));
+                  return sb.toString().trim();
+              }
+
+              private List<PData> sortedPlayers(boolean byTime) {
+                  List<PData> all = new ArrayList<>(players.values());
+                  if (byTime) {
+                      all.sort((a, b) -> Long.compare(b.totalSec, a.totalSec));
+                  } else {
+                      all.sort((a, b) -> Long.compare(b.lastSeen, a.lastSeen));
+                  }
+                  return all;
+              }
+
+              // ------------------------------------------------------------------ chat commands
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("sstats")) {
+                      return false;
+                  }
+                  if (!sender.hasPermission("sstats.use")) {
+                      sender.sendMessage(TextFormat.RED + "У вас нет прав на эту команду.");
+                      return true;
+                  }
+                  try {
+                      flushOnline();
+                      String sub = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
+                      if (sub.isEmpty()) {
+                          if (sender instanceof Player) {
+                              openMain((Player) sender);
+                          } else {
+                              showOverview(sender);
+                          }
+                      } else if (sub.equals("text") || sub.equals("stats")) {
+                          showOverview(sender);
+                      } else if (sub.equals("list") || sub.equals("список")) {
+                          showList(sender, args, false);
+                      } else if (sub.equals("top") || sub.equals("топ")) {
+                          showList(sender, args, true);
+                      } else if (sub.equals("new") || sub.equals("новые")) {
+                          showNew(sender, args);
+                      } else if (sub.equals("player") || sub.equals("игрок")) {
+                          showPlayer(sender, args);
+                      } else {
+                          showHelp(sender);
+                      }
+                  } catch (Exception ex) {
+                      sender.sendMessage(TextFormat.RED + "Ошибка при выводе статистики: " + ex);
+                      getLogger().error("EclipsStats: " + ex);
+                  }
+                  return true;
+              }
+
+              private void showHelp(CommandSender s) {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append(TextFormat.GOLD).append("[Eclips] ").append(TextFormat.WHITE).append("Команды статистики\n");
+                  sb.append(TextFormat.YELLOW).append("/sstats").append(TextFormat.GRAY).append(" - графическое меню\n");
+                  sb.append(TextFormat.YELLOW).append("/sstats text").append(TextFormat.GRAY).append(" - общая статистика в чате\n");
+                  sb.append(TextFormat.YELLOW).append("/sstats list [стр]").append(TextFormat.GRAY).append(" - все игроки (по последнему заходу)\n");
+                  sb.append(TextFormat.YELLOW).append("/sstats top [стр]").append(TextFormat.GRAY).append(" - все игроки (по времени онлайн)\n");
+                  sb.append(TextFormat.YELLOW).append("/sstats new [day|week|month]").append(TextFormat.GRAY).append(" - новые ники\n");
+                  sb.append(TextFormat.YELLOW).append("/sstats player <ник>").append(TextFormat.GRAY).append(" - данные об игроке");
+                  s.sendMessage(sb.toString());
+              }
+
+              private void showOverview(CommandSender s) {
+                  s.sendMessage(TextFormat.GOLD + "[Eclips] " + TextFormat.WHITE + "Статистика сервера\n" + qualityBody() + "\n"
+                          + overviewBody() + "\n"
+                          + TextFormat.GRAY + "Меню: /sstats (в игре). Текстом: list, top, new, player <ник>");
+              }
+
+              private void showList(CommandSender s, String[] args, boolean byTime) {
+                  int page = 1;
+                  if (args.length > 1) {
+                      try {
+                          page = Integer.parseInt(args[1]);
+                      } catch (NumberFormatException ignored) {
+                          page = 1;
+                      }
+                  }
+                  List<PData> all = sortedPlayers(byTime);
+                  int pages = Math.max(1, (all.size() + pageSize - 1) / pageSize);
+                  page = Math.min(Math.max(page, 1), pages);
+                  int from = (page - 1) * pageSize;
+                  int to = Math.min(all.size(), from + pageSize);
+
+                  StringBuilder sb = new StringBuilder();
+                  sb.append(TextFormat.GOLD).append("[Eclips] ").append(TextFormat.WHITE)
+                          .append(byTime ? "Игроки по времени онлайн" : "Игроки по последнему заходу")
+                          .append(TextFormat.GRAY).append(" (стр. ").append(page).append("/").append(pages)
+                          .append(", всего ").append(all.size()).append(")\n");
+                  for (int i = from; i < to; i++) {
+                      PData d = all.get(i);
+                      boolean on = checkpoints.containsKey(d.key);
+                      sb.append(TextFormat.GRAY).append(i + 1).append(". ").append(TextFormat.WHITE).append(d.name)
+                              .append(TextFormat.GRAY).append(" - ");
+                      if (on) {
+                          sb.append(TextFormat.GREEN).append("сейчас онлайн");
+                      } else {
+                          sb.append(TextFormat.YELLOW).append(fmt(d.lastSeen));
+                      }
+                      sb.append(TextFormat.GRAY).append(" - ").append(TextFormat.WHITE).append(dur(d.totalSec)).append('\n');
+                  }
+                  if (all.isEmpty()) {
+                      sb.append(TextFormat.GRAY).append("Пока пусто");
+                  } else {
+                      sb.append(TextFormat.GRAY).append("Формат: ник - последний заход - онлайн за всё время");
+                  }
+                  s.sendMessage(sb.toString());
+              }
+
+              private void showNew(CommandSender s, String[] args) {
+                  String p = args.length > 1 ? args[1].toLowerCase(Locale.ROOT) : "day";
+                  int days = 1;
+                  if (p.equals("week") || p.equals("w") || p.equals("неделя") || p.equals("неделю")) {
+                      days = 7;
+                  } else if (p.equals("month") || p.equals("m") || p.equals("месяц")) {
+                      days = 30;
+                  }
+                  s.sendMessage(TextFormat.GOLD + "[Eclips] " + TextFormat.WHITE + "Новые ники\n" + newNicksText(days, true));
+              }
+
+              private void showPlayer(CommandSender s, String[] args) {
+                  if (args.length < 2) {
+                      s.sendMessage(TextFormat.YELLOW + "Использование: /sstats player <ник>");
+                      return;
+                  }
+                  StringBuilder nameBuilder = new StringBuilder();
+                  for (int i = 1; i < args.length; i++) {
+                      if (i > 1) {
+                          nameBuilder.append(' ');
+                      }
+                      nameBuilder.append(args[i]);
+                  }
+                  PData d = players.get(nameBuilder.toString().toLowerCase(Locale.ROOT));
+                  if (d == null) {
+                      s.sendMessage(TextFormat.RED + "Игрок не найден в статистике: " + nameBuilder);
+                      return;
+                  }
+                  s.sendMessage(TextFormat.GOLD + "[Eclips] " + TextFormat.WHITE + "Игрок " + d.name + "\n" + playerBody(d));
+              }
+
+              // ------------------------------------------------------------------ graphical menu
+
+              private Menu simple(String title, String content) {
+                  Menu m = new Menu();
+                  m.simple = new FormWindowSimple(title, content);
+                  return m;
+              }
+
+              private void btn(Menu m, String text, Consumer<Player> action) {
+                  m.simple.addButton(new ElementButton(text));
+                  m.actions.add(action);
+              }
+
+              private void show(Player p, Menu m) {
+                  String k = key(p);
+                  openMenus.put(k, m);
+                  getServer().getScheduler().scheduleDelayedTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          if (openMenus.get(k) != m) {
+                              return;
+                          }
+                          try {
+                              p.showFormWindow(m.window());
+                          } catch (Exception ex) {
+                              getLogger().error("EclipsStats: не удалось открыть меню: " + ex);
+                          }
+                      }
+                  }, 3);
+              }
+
+              private void openMain(Player p) {
+                  flushOnline();
+                  Menu m = simple("Eclips - Статистика", qualityBody() + "\n\n" + TextFormat.YELLOW + "Онлайн: "
+                          + TextFormat.WHITE + getServer().getOnlinePlayers().size() + TextFormat.YELLOW
+                          + " | Игроков в базе: " + TextFormat.WHITE + players.size());
+                  btn(m, "Общая статистика", this::openOverview);
+                  btn(m, "Игроки по последнему заходу", pl -> openList(pl, false, 1));
+                  btn(m, "Игроки по времени онлайн", pl -> openList(pl, true, 1));
+                  btn(m, "Новые ники", this::openNewMenu);
+                  btn(m, "Найти игрока", this::openSearch);
+                  show(p, m);
+              }
+
+              private void openOverview(Player p) {
+                  Menu m = simple("Общая статистика", overviewBody());
+                  btn(m, "Обновить", this::openOverview);
+                  btn(m, "В меню", this::openMain);
+                  show(p, m);
+              }
+
+              private void openList(Player p, boolean byTime, int page) {
+                  List<PData> all = sortedPlayers(byTime);
+                  int size = menuPageSize;
+                  int pages = Math.max(1, (all.size() + size - 1) / size);
+                  final int pg = Math.min(Math.max(page, 1), pages);
+                  int from = (pg - 1) * size;
+                  int to = Math.min(all.size(), from + size);
+
+                  Menu m = simple(byTime ? "Игроки: по времени онлайн" : "Игроки: по последнему заходу",
+                          TextFormat.GRAY + "Страница " + pg + "/" + pages + ", всего игроков: " + all.size()
+                                  + "\nНажми на игрока, чтобы открыть подробности");
+                  for (int i = from; i < to; i++) {
+                      final PData d = all.get(i);
+                      boolean on = checkpoints.containsKey(d.key);
+                      String sub = (on ? TextFormat.GREEN + "сейчас онлайн" : TextFormat.WHITE + fmt(d.lastSeen))
+                              + TextFormat.WHITE + " | " + dur(d.totalSec);
+                      btn(m, d.name + "\n" + sub, pl -> openPlayer(pl, d, back -> openList(back, byTime, pg)));
+                  }
+                  if (pg > 1) {
+                      btn(m, "<< Назад", pl -> openList(pl, byTime, pg - 1));
+                  }
+                  if (pg < pages) {
+                      btn(m, "Вперёд >>", pl -> openList(pl, byTime, pg + 1));
+                  }
+                  btn(m, "В меню", this::openMain);
+                  show(p, m);
+              }
+
+              private void openPlayer(Player p, PData d, Consumer<Player> back) {
+                  Menu m = simple("Игрок " + d.name, playerBody(d));
+                  btn(m, "Назад", back);
+                  btn(m, "В меню", this::openMain);
+                  show(p, m);
+              }
+
+              private void openNewMenu(Player p) {
+                  int[] c = newCounts();
+                  Menu m = simple("Новые ники", TextFormat.GRAY + "Выбери период");
+                  btn(m, "Сегодня: " + c[0], pl -> openNewList(pl, 1));
+                  btn(m, "7 дней: " + c[1], pl -> openNewList(pl, 7));
+                  btn(m, "30 дней: " + c[2], pl -> openNewList(pl, 30));
+                  btn(m, "В меню", this::openMain);
+                  show(p, m);
+              }
+
+              private void openNewList(Player p, int days) {
+                  Menu m = simple("Новые ники " + periodTitle(days), newNicksText(days, false));
+                  btn(m, "К периодам", this::openNewMenu);
+                  btn(m, "В меню", this::openMain);
+                  show(p, m);
+              }
+
+              private void openSearch(Player p) {
+                  Menu m = new Menu();
+                  m.custom = new FormWindowCustom("Найти игрока");
+                  m.custom.addElement(new ElementInput("Введите ник или часть ника", "например: Steve"));
+                  m.onInput = this::searchResult;
+                  show(p, m);
+              }
+
+              private void searchResult(Player p, String text) {
+                  String q = text == null ? "" : text.trim().toLowerCase(Locale.ROOT);
+                  if (q.isEmpty()) {
+                      openSearch(p);
+                      return;
+                  }
+                  PData exact = players.get(q);
+                  if (exact != null) {
+                      openPlayer(p, exact, this::openSearch);
+                      return;
+                  }
+                  List<PData> found = new ArrayList<>();
+                  for (PData d : players.values()) {
+                      if (d.key.contains(q)) {
+                          found.add(d);
+                      }
+                  }
+                  found.sort((a, b) -> Long.compare(b.lastSeen, a.lastSeen));
+                  if (found.isEmpty()) {
+                      Menu m = simple("Поиск игрока", TextFormat.RED + "Игрок не найден: " + text.trim());
+                      btn(m, "Искать снова", this::openSearch);
+                      btn(m, "В меню", this::openMain);
+                      show(p, m);
+                      return;
+                  }
+                  if (found.size() == 1) {
+                      openPlayer(p, found.get(0), this::openSearch);
+                      return;
+                  }
+                  Menu m = simple("Результаты поиска", TextFormat.GRAY + "Найдено: " + found.size()
+                          + (found.size() > 10 ? " (показаны первые 10)" : ""));
+                  int shown = Math.min(found.size(), 10);
+                  for (int i = 0; i < shown; i++) {
+                      final PData d = found.get(i);
+                      boolean on = checkpoints.containsKey(d.key);
+                      btn(m, d.name + "\n" + (on ? TextFormat.GREEN + "сейчас онлайн" : TextFormat.WHITE + fmt(d.lastSeen)),
+                              pl -> openPlayer(pl, d, this::openSearch));
+                  }
+                  btn(m, "Искать снова", this::openSearch);
+                  btn(m, "В меню", this::openMain);
+                  show(p, m);
+              }
+          }
+          EOF_FILE
+
+      - name: Build with Maven
+        working-directory: plugin
+        run: mvn -B package
+
+      - name: Upload plugin jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: EclipsStats
+          path: plugin/target/EclipsStats.jar
